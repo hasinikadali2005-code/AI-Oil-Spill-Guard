@@ -1,91 +1,91 @@
-import streamlit as st
-import tensorflow as tf
-import numpy as np
-from PIL import Image
+import os
+from flask import Flask, render_template, request, jsonify
+from werkzeug.utils import secure_filename
+from pathlib import Path
+from ml_api import detector
 
-st.title("Satellite Oil Spill Detection System")
+# ==============================
+# FLASK APP
+# ==============================
 
-# Load trained model
-@st.cache_resource
-def load_model():
-    return tf.keras.models.load_model("oil_spill_unet.h5", compile=False)
+app = Flask(__name__)
 
-model = load_model()
-IMG_SIZE = 256
+UPLOAD_FOLDER = "static/uploads"
+Path(UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
 
-def preprocess_image(image):
-    image = image.resize((IMG_SIZE, IMG_SIZE))
-    image = np.array(image)/255.0
-    image = np.expand_dims(image, axis=0)
-    return image
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-def predict_mask(image):
-    img = preprocess_image(image)
-    prediction = model.predict(img)[0]
-    mask = (prediction > 0.5).astype(np.uint8)
-    return mask
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 
-def overlay_mask(image, mask):
-    image = np.array(image.resize((IMG_SIZE, IMG_SIZE)))
-    overlay = image.copy()
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-    # Highlight oil spill in red
-    overlay[mask[:,:,0] == 1] = [255,0,0]
+def as_data_uri(image_value):
+    if not image_value:
+        return None
+    if isinstance(image_value, str) and image_value.startswith('data:image'):
+        return image_value
+    return f"data:image/png;base64,{image_value}"
 
-    return overlay
+# ==============================
+# ROUTES
+# ==============================
 
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-uploaded_file = st.file_uploader("Upload Satellite Image", type=["png","jpg","jpeg"])
+@app.route('/predict', methods=['POST'])
+def predict():
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'})
 
-if uploaded_file is not None:
+        file = request.files['file']
 
-    image = Image.open(uploaded_file)
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'})
 
-    st.subheader("Uploaded Satellite Image")
-    st.image(image)
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'Invalid file type'})
 
-    mask = predict_mask(image)
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
 
-    st.subheader("Predicted Oil Spill Mask")
-    st.image(mask[:,:,0]*255)
+        result = detector.predict(filepath)
+        if not result.get('success', False):
+            return jsonify(result), 400
 
-    overlay = overlay_mask(image, mask)
+        confidence = float(result.get('confidence', 0.0))
+        has_oil_spill = bool(result.get('has_oil_spill', confidence >= 50.0))
 
-    st.subheader("Oil Spill Highlighted on Image")
-    st.image(overlay)
+        response = {
+            'success': True,
+            'confidence': round(confidence, 2),
+            'has_oil_spill': has_oil_spill,
+            'is_oil_spill': has_oil_spill,
+            'status_text': 'Oil Spill Detected' if has_oil_spill else 'No Spill',
+            'original_image': as_data_uri(result.get('original_image')),
+            'mask_image': as_data_uri(result.get('mask_image')),
+            'overlay_image': as_data_uri(result.get('overlay_image')),
+        }
 
-    # Calculate statistics
-    oil_pixels = np.sum(mask)
-    total_pixels = IMG_SIZE * IMG_SIZE
+        return jsonify(response)
 
-    oil_percentage = (oil_pixels / total_pixels) * 100
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
-    st.subheader("Detection Statistics")
+@app.route('/health')
+def health():
+    return {
+        "status": "ok",
+        "model_loaded": detector.model_loaded
+    }
 
-    st.write(f"Oil Spill Pixels Detected: {oil_pixels}")
-    st.write(f"Total Pixels: {total_pixels}")
-    st.write(f"Oil Spill Percentage: {oil_percentage:.2f}%")
+# ==============================
+# RUN
+# ==============================
 
-    # Risk Level
-    st.subheader("Risk Assessment")
-
-    if oil_percentage < 1:
-        st.success("No Oil Spill Detected")
-        st.info("The satellite image does not show significant oil contamination.")
-        st.write("Environmental Impact: Minimal or none.")
-
-    elif oil_percentage < 5:
-        st.warning("Minor Oil Spill Detected")
-        st.write("Insight: Small patches of oil are visible in the water.")
-        st.write("Environmental Impact: May affect small marine organisms locally.")
-
-    elif oil_percentage < 15:
-        st.warning("Moderate Oil Spill Detected")
-        st.write("Insight: A noticeable oil spill area is present in the satellite image.")
-        st.write("Environmental Impact: Possible impact on marine life and coastal ecosystems.")
-
-    else:
-        st.error("Severe Oil Spill Detected")
-        st.write("Insight: Large oil contamination detected across the water surface.")
-        st.write("Environmental Impact: High risk to marine biodiversity and nearby coastal areas.")
-        st.write("Recommended Action: Immediate environmental monitoring and containment required.")
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)
